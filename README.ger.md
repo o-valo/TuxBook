@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="tuxbook.jpg" width="100%"
+       alt="![Konzeptionelle Darstellung eines TuxBook-Workflows im Serverraum mit Alpha Translator, Omega Printers und Beta Editor] 
+    ">
+</p>
+
 # TuxBook (tuxbook)
 
 [![CI](https://github.com/o-valo/TuxBook/actions/workflows/ci.yml/badge.svg)](https://github.com/o-valo/TuxBook/actions/workflows/ci.yml)
