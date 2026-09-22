@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""tuxbook — TuxBook: ganze Bücher (PDF) übersetzen und neu setzen.
+
+Endpunkte kommen aus tuxbook.conf (siehe tuxbook.conf.example) oder
+Umgebungsvariablen — keine fest verdrahteten Adressen im Code.
+
+Copyright (C) 2026 Olav Surawski (https://github.com/o-valo)
+SPDX-License-Identifier: AGPL-3.0-or-later
+"""
+import os
+import sys
+from pathlib import Path
+
+# --- Venv-Autostart -------------------------------------------------------
+# Wird dieses Skript ohne aktiviertes Venv gestartet, wechselt es selbst in
+# das Projekt-Venv (.venv neben dieser Datei) und fuehrt sich dort erneut
+# aus. Dadurch funktioniert   ./tuxbook ...   auch ohne vorheriges
+#   source .venv/bin/activate
+
+
+def _reexec_in_venv() -> None:
+    here = Path(__file__).resolve().parent
+    venv_base = here / ".venv"
+    if not (venv_base / "pyvenv.cfg").exists():
+        return  # kein Projekt-Venv -> System-Python (User ist selbst zuständig)
+    venv_py = venv_base / "bin" / "python3"
+    if not venv_py.exists():
+        return
+    if getattr(sys, "prefix", "") == str(venv_base) or \
+            os.environ.get("VIRTUAL_ENV") == str(venv_base):
+        return  # laufen bereits im Ziel-Venv
+    os.execv(str(venv_py), [str(venv_py)] + sys.argv)
+
+
+_reexec_in_venv()
+# --------------------------------------------------------------------------
+
+import argparse
+import json
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from tuxbook_lib import config, project
+from tuxbook_lib import __version__
+from tuxbook_lib.extract import (extract_page, page_to_jpeg, Para,
+                             re_split_paras, EXTRACT_VERSION)
+from tuxbook_lib.ocr import ocr_jpeg, tesseract_available
+from tuxbook_lib.translate import (Translator, _MiniBackend, save_page,
+                               load_page)
+from tuxbook_lib.llm import BahnhofClient, OllamaClient, LLMError
+from tuxbook_lib.render_page import render_page_mode
+from tuxbook_lib.render_flow import render_flow
+from tuxbook_lib.render_md import render_markdown
+from tuxbook_lib.render_md2pdf import md_to_pdf
+from tuxbook_lib.images import build_image_map
+
+
+def _add_common(p):
+    p.add_argument("--bahnhof-url", default=config.BAHNHOF_URL)
+    p.add_argument("--bahnhof-model", default=config.BAHNHOF_MODEL)
+    p.add_argument("--ollama-url", default=config.OLLAMA_URL)
+    p.add_argument("--ollama-model", default=config.OLLAMA_VISION_MODEL)
+    p.add_argument("--ignore-window", action="store_true",
+                   help="Zeitfenster-Sperre für Ollama ignorieren "
+                        "(12:30-13:30, 19:30-20:30)")
+
+
+def _restore_from_cache(pd, cached: dict) -> None:
+    """PageData aus Cache-Eintrag anreichern. Wichtig: Überschriften-Arten
+    (heading) nicht zerstören — fehlen 'kinds' im Cache, bleibt die frische
+    Extraktion (mit korrekten kinds) stehen; nur OCR-Seiten brauchen den
+    gecachten Text, da ihre Paras nicht aus dem PDF extrahierbar sind."""
+    pd.ocr_used = bool(cached.get("ocr"))
+    src_texts = cached.get("src") or []
+    kinds = cached.get("kinds") or []
+    if pd.ocr_used or kinds:
+        pd.paras = [Para(t, pd.body_size,
+                         kind=(kinds[i] if i < len(kinds) else "para"))
+                    for i, t in enumerate(src_texts)]
+        pd.blocks = []
+    # sonst: frische pd.paras behalten (kinds korrekt, Texte kommen
+    # ohnehin aus 'translated')
+
+
+def cmd_run(args):
+    src_pdf = Path(args.input).expanduser().resolve()
+    if not src_pdf.exists():
+        raise project.CleanError(f"Eingabedatei fehlt: {src_pdf}")
+    if args.mode not in ("page", "flow"):
+        raise project.CleanError("--mode muss 'page' oder 'flow' sein")
+
+    # ZIP-Quelle: zu einem Master-PDF vorbereiten (gecacht im Job)
+    if src_pdf.suffix.lower() == ".zip":
+        from tuxbook_lib import zipsrc
+        job_name = args.job or f"{src_pdf.stem}_{args.tgt_lang}"
+        job = project.Job(job_name)
+        src_pdf, zip_note = zipsrc.prepare_source(src_pdf, job)
+        print(f"ZIP-Quelle: {zip_note}")
+        args.job = job_name
+
+    import pymupdf
+    src = pymupdf.open(src_pdf)
+    n = src.page_count
+    wanted = project.parse_ranges(args.pages, n)
+    print(f"Quelle: {src_pdf.name}  |  {n} Seiten  |  im Bereich: {len(wanted)}")
+
+    bahnhof = BahnhofClient(args.bahnhof_url, args.bahnhof_model)
+    ocr = OllamaClient(args.ollama_url, args.ollama_model,
+                       ignore_window=args.ignore_window)
+
+    src_lang = args.src_lang
+    tgt_lang = args.tgt_lang
+    if args.render_only:
+        # Kein LLM-Kontakt nötig: Einstellungen aus dem Manifest übernehmen
+        job_name_ro = args.job or f"{src_pdf.stem}_{tgt_lang}"
+        ms = (project.Job(job_name_ro).load_manifest() or {}).get("settings", {})
+        if ms.get("src"):
+            src_lang = ms["src"]
+        if ms.get("tgt"):
+            tgt_lang = ms["tgt"]
+        print(f"Render-only: Sprache {src_lang} -> {tgt_lang} (aus Manifest)")
+    if src_lang == "auto":
+        sample = ""
+        for p in wanted[:2]:
+            sample += src[p].get_text()[:900] + "\n"
+        if not sample.strip():
+            src_lang = "en"
+        else:
+            src_lang = bahnhof.detect_language(sample)
+            print(f"Quellsprache erkannt: {src_lang}")
+
+    s_disp = config.lang_display(src_lang if src_lang != "auto" else "en")
+    t_disp = config.lang_display(tgt_lang)
+
+    job_name = args.job or f"{src_pdf.stem}_{tgt_lang}"
+    job = project.Job(job_name)
+    settings = {"mode": args.mode, "src": src_lang, "tgt": tgt_lang,
+                "pages": args.pages, "input": str(src_pdf)}
+    man = job.ensure(settings, src_pdf)
+    if man.get("settings", {}).get("mode") != args.mode:
+        print(f"HINWEIS: Job existierte mit Modus "
+              f"'{man['settings'].get('mode')}', setze auf '{args.mode}'.")
+        man["settings"]["mode"] = args.mode
+        job.manifest_path.write_text(json.dumps(man, ensure_ascii=False, indent=1),
+                                     encoding="utf-8")
+    man["page_count"] = n
+    job.manifest_path.write_text(json.dumps(man, ensure_ascii=False, indent=1),
+                                 encoding="utf-8")
+
+    glossary = project.load_glossary(args.glossary)
+    if glossary:
+        print(f"Glossar: {len(glossary)} Einträge")
+
+    done = job.done_pages()
+    todo = [] if args.render_only else \
+        [p for p in wanted if args.retranslate or p not in done]
+    if not args.render_only and len(todo) < len(wanted):
+        print(f"Resume: {len(wanted) - len(todo)} Seiten bereits übersetzt, "
+              f"{len(todo)} übrig.")
+
+    mini = None
+    terms = {}
+    if args.engine == "ollama":
+        if not args.translate_model:
+            raise project.CleanError("--engine ollama braucht --translate-model "
+                                     "<name> (Modelle auflisten: "
+                                     "curl <ollama-url>/api/tags)")
+        mini = _MiniBackend(ocr, args.translate_model, s_disp, t_disp)
+        print(f"Übersetzungs-Engine: Ollama [{args.translate_model}] "
+              f"@ {args.ollama_url}")
+    else:
+        # Terminologie-Lock: Schlüsselbegriffe einmal festlegen und überall
+        # konsistent vorgeben (kein Drift über 185 Seiten)
+        if not args.render_only and not args.no_term_lock:
+            from tuxbook_lib.translate import extract_terms
+            sample_texts = []
+            for pno in wanted[:8]:
+                t = src[pno].get_text().strip()
+                if len(t) > 200:
+                    sample_texts.append(t)
+                if len(sample_texts) >= 3:
+                    break
+            if sample_texts:
+                try:
+                    terms = extract_terms(bahnhof, sample_texts, t_disp)
+                    if terms:
+                        print(f"Terminologie-Lock: {len(terms)} Begriffe "
+                              "festgelegt")
+                except LLMError as e:
+                    print(f"WARN Terminologie-Lock fehlgeschlagen: {e}")
+    if mini is not None and terms:
+        mini.terms = terms
+    translator = Translator(bahnhof, s_disp, t_disp, glossary,
+                            sleep=args.sleep, verbose=True,
+                            mini_backend=mini, terms=terms)
+    engine = "off" if args.no_ocr else args.ocr
+    if engine != "off":
+        if tesseract_available():
+            print("OCR: Tesseract (lokal, Standard)")
+            if engine in ("auto", "ollama"):
+                print("     Ollama-Vision nur auf Wunsch (--ocr ollama/auto)")
+        else:
+            print("OCR: Tesseract NICHT installiert! "
+                  "(sudo apt install tesseract-ocr ...) -> "
+                  "--ocr ollama als Übergangslösung")
+
+    # ---- 1) Extrahieren (Hauptthread, PyMuPDF ist nicht thread-sicher) ----
+    todo_data: list[tuple] = []   # (pno, PageData, jpeg_bytes|None)
+    for pno in todo:
+        pd = extract_page(src, pno, text_source=args.text_source)
+        jpeg = None
+        if pd.ocr_used and engine != "off":
+            jpeg = page_to_jpeg(src, pno)
+        todo_data.append((pno, pd, jpeg))
+
+    # ---- 2) OCR + Übersetzen (parallel) -----------------------------------
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Nachbarseiten-Kontext (Quelltext) für Satz-Kontinuität an Seitengrenzen
+    neighbor: dict[int, tuple] = {}
+    for idx, (pno, pdx, _) in enumerate(todo_data):
+        prev_tail = ([x.text for x in todo_data[idx - 1][1].paras]
+                     if idx > 0 else None)
+        next_head = ([x.text for x in todo_data[idx + 1][1].paras]
+                     if idx < len(todo_data) - 1 else None)
+        if prev_tail or next_head:
+            neighbor[pno] = (prev_tail, next_head)
+
+    pages: dict[int, tuple] = {}
+    print_lock = threading.Lock()
+    progress = {"done": 0, "durations": []}
+    t0 = time.time()
+
+    def worker(pno: int, pd, jpeg: bytes | None):
+        t1 = time.time()
+        cached = load_page(job.pages_dir, pno)
+        if cached and cached.get("xver") != EXTRACT_VERSION:
+            cached = None  # alte Extraktionslogik -> Cache verwerfen
+        # Cache nur nutzbar, wenn gleiche Engine erzeugt wurde
+        # (alte Einträge ohne engine-Feld stammen vom Bahnhof)
+        if cached and (cached.get("engine") or "bahnhof") != args.engine:
+            cached = None
+        # Cache nur nutzbar, wenn gleiche Textquelle (embedded/ocr)
+        if cached and (cached.get("text_source") or "auto") != args.text_source:
+            cached = None
+
+        if cached and cached.get("trans") is not None and not args.retranslate:
+            _restore_from_cache(pd, cached)
+            trans = cached["trans"]
+        else:
+            if jpeg is not None:
+                text, used_engine = ocr_jpeg(jpeg, src_lang, engine, ocr)
+                if text:
+                    pd.paras = [Para(t.replace("\n", " ").strip(), pd.body_size)
+                                for t in re_split_paras(text) if t.strip()]
+                    pd.ocr_used = True
+                    with print_lock:
+                        print(f"  S.{pno+1}: OCR ({len(pd.paras)} Absätze) "
+                              f"[{used_engine}]")
+                else:
+                    pd.paras = []
+                    with print_lock:
+                        print(f"  S.{pno+1}: WARN OCR ohne Ergebnis "
+                              f"(engine={used_engine})")
+
+            if pd.paras:
+                # eigener Translator pro Thread; Nachbar-Kontext für Kontinuität
+                pt, nh = neighbor.get(pno, (None, None))
+                tr = Translator(bahnhof, s_disp, t_disp, glossary,
+                                sleep=args.sleep, verbose=False, terms=terms)
+                trans = tr.translate_page(pd, pt, nh)
+            else:
+                trans = []
+
+            if trans is None:
+                # LLM fehlgeschlagen: NICHT als fertig cachen,
+                # beim nächsten Lauf (Resume) erneut versuchen
+                save_page(job.pages_dir, pno, {
+                    "page": pno,
+                    "xver": EXTRACT_VERSION,
+                    "engine": args.engine,
+                    "text_source": args.text_source,
+                    "src": [p.text for p in pd.paras] or [b.text for b in pd.blocks],
+                    "kinds": [p.kind for p in pd.paras],
+                    "trans": None,
+                    "ocr": pd.ocr_used,
+                    "mode_src": "paras" if pd.paras else "blocks",
+                })
+                with print_lock:
+                    print(f"  S.{pno+1}: WARN Übersetzung fehlgeschlagen "
+                          "-> wird beim nächsten Lauf wiederholt")
+                return pno, pd, None
+
+            save_page(job.pages_dir, pno, {
+                "page": pno,
+                "xver": EXTRACT_VERSION,
+                "engine": args.engine,
+                "text_source": args.text_source,
+                "src": [p.text for p in pd.paras] or [b.text for b in pd.blocks],
+                "kinds": [p.kind for p in pd.paras],
+                "trans": trans,
+                "ocr": pd.ocr_used,
+                "mode_src": "paras" if pd.paras else "blocks",
+            })
+
+        dt = time.time() - t1
+        if trans is None:
+            return pno, pd, None  # kein Fortschritt zählen
+        with print_lock:
+            progress["done"] += 1
+            progress["durations"].append(dt)
+            ds = progress["durations"][-20:]
+            avg = sum(ds) / len(ds)
+            rem = len(todo_data) - progress["done"]
+            eta = avg * max(1, rem) / max(args.workers, 1)
+            print(f"[{progress['done']}/{len(todo_data)}] Seite {pno+1}: OK  "
+                  f"({dt:.1f}s | Ø {avg:.1f}s | ETA {eta/60:.0f} min)")
+        # leichte Repräsentanz zurückgeben (keine Geometrie) — schont RAM
+        # bei großen Büchern (1000+ Seiten)
+        light = (pd.body_size, [(p.kind, p.text, p.size) for p in pd.paras])
+        return pno, light, trans
+
+    if args.workers > 1:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = [ex.submit(worker, pno, pd, jpeg) for pno, pd, jpeg in todo_data]
+            for f in as_completed(futs):
+                pno, light, trans = f.result()
+                pages[pno] = (light, trans)
+    else:
+        for pno, pd, jpeg in todo_data:
+            pno, light, trans = worker(pno, pd, jpeg)
+            pages[pno] = (light, trans)
+
+    # PageData der Übersetzungsphase freigeben (RAM für 1000-Seiten-Bücher)
+    todo_data.clear()
+    neighbor.clear()
+
+    total_min = (time.time() - t0) / 60
+    print(f"Übersetzt: {len(pages)} Seiten in {total_min:.1f} min")
+
+    # ---- 2) Rendern (speicherarm: keine volle Seitenliste im RAM) ---------
+    if not args.no_render:
+        if args.mode == "page":
+            render_scope = range(n)   # 1:1: alle Seiten des Originals
+        else:
+            # Flow: alle übersetzten Seiten (dieser Lauf + Cache)
+            done_cache = job.done_pages()
+            render_scope = sorted(set(pages.keys()) | done_cache)
+
+        translated: dict[int, list[str]] = {}
+        light_pages: dict[int, tuple] = {}  # pno -> (body_size, [(kind,text)])
+        for pno, (light, trans) in pages.items():
+            translated[pno] = trans
+            light_pages[pno] = light
+        for pno in render_scope:
+            if pno in translated:
+                continue
+            cached = load_page(job.pages_dir, pno)
+            if cached and cached.get("trans") is not None \
+                    and cached.get("xver") == EXTRACT_VERSION:
+                texts = cached.get("src") or []
+                kinds = cached.get("kinds") or []
+                if cached.get("ocr") or kinds:
+                    light_pages[pno] = (
+                        10.0,
+                        [(kinds[i] if i < len(kinds) else "para", t, 0.0)
+                         for i, t in enumerate(texts)])
+                else:
+                    pd = extract_page(src, pno, text_source=args.text_source)
+                    light_pages[pno] = (
+                        pd.body_size, [(p.kind, p.text, p.size) for p in pd.paras])
+                translated[pno] = cached["trans"]
+            else:
+                # ohne Übersetzung: Originaltext durchreichen
+                pd = extract_page(src, pno, text_source=args.text_source)
+                light_pages[pno] = (
+                    pd.body_size, [(p.kind, p.text, p.size) for p in pd.paras])
+                translated[pno] = ([b.text for b in pd.blocks] if args.mode == "page"
+                                   else [p.text for p in pd.paras])
+
+        out_path = job.output_path()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Bilder je Seite extrahieren (für den MD-Export) — Vollseiten-Scans
+        # werden gefiltert; sie liegen neben dem MD, damit die relativen
+        # Referenzen im Markdown stimmen
+        md_path = out_path.with_suffix(".md")
+        img_dir = out_path.parent / f"{md_path.stem}_bilder"
+        image_map = build_image_map(src, out_path.parent, md_name=img_dir.name)
+        n_imgs = sum(len(v) for v in image_map.values())
+        if n_imgs:
+            print(f"Bilder extrahiert: {n_imgs}  -> {img_dir}")
+
+        if args.mode == "page":
+            out = pymupdf.open()
+            # Streaming: Seiten einzeln extrahieren, nie alle im RAM
+            def page_iter():
+                for p in render_scope:
+                    yield extract_page(src, p, text_source=args.text_source)
+            render_page_mode(src, out, page_iter(), translated)
+            out.save(str(out_path), garbage=4, deflate=True)
+            out.close()
+        else:
+            items = [(pno, light_pages[pno][0], light_pages[pno][1])
+                     for pno in render_scope if pno in light_pages]
+            render_flow(items, translated, out_path,
+                        title=args.title, page_break_per_page=args.page_break,
+                        cover_image=args.cover_image,
+                        cover_subtitle=args.cover_subtitle)
+
+        size = out_path.stat().st_size / 1e6
+        print(f"\nFertig: {out_path}  ({size:.1f} MB, Modus={args.mode})")
+
+        # Markdown-Version immer mitschreiben (als korrigierbare Quelle für
+        # den Neu-Satz:  tuxbook md2pdf <md>  erzeugt daraus das Buch-PDF)
+        items = [(pno, light_pages[pno][0], light_pages[pno][1])
+                 for pno in render_scope if pno in light_pages]
+        render_markdown(items, translated,
+                        md_path,
+                        title=args.title if args.mode == "flow" else None,
+                        image_map=image_map,
+                        render_scope=render_scope)
+        print(f"Markdown: {md_path}  ({md_path.stat().st_size//1024} KB)")
+        print(f"PDF aus MD neu setzen:  ./tuxbook md2pdf {md_path}")
+    else:
+        print("\nÜbersetzung abgeschlossen (Rendering übersprungen: --no-render). "
+              "Später rendern mit:  tuxbook run <pdf> --job <name> --render-only ...")
+
+    src.close()
+    return 0
+
+
+def cmd_status(args):
+    job = project.Job(args.job)
+    man = job.load_manifest()
+    if not man:
+        raise project.CleanError(f"Unbekannter Job: {args.job}")
+    done = job.done_pages()
+    st = man.get("settings", {})
+    print(f"Job:      {job.name}")
+    print(f"Modus:    {st.get('mode')}")
+    print(f"Richtung: {st.get('src')} -> {st.get('tgt')}")
+    print(f"Seiten übersetzt: {len(done)}"
+          + (f"/{man.get('page_count')}" if man.get("page_count") else ""))
+    print(f"Ziel:     {job.output_path()}")
+    return 0
+
+
+def cmd_make_test(args):
+    from tools.make_test_pdf import make_test_pdf
+    p = make_test_pdf(Path(args.out).expanduser())
+    print(f"Test-PDF erzeugt: {p}")
+    return 0
+
+
+def cmd_ocr_test(args):
+    import pymupdf
+    src = pymupdf.open(Path(args.input).expanduser().resolve())
+    pno = args.page - 1
+    if not (0 <= pno < src.page_count):
+        raise project.CleanError(f"Seite {args.page} existiert nicht "
+                                 f"(1-{src.page_count})")
+    ocr = OllamaClient(args.ollama_url, args.ollama_model,
+                       ignore_window=args.ignore_window)
+    w = OllamaClient.check_window(args.ollama_url)
+    if w and not args.ignore_window:
+        print(f"ACHTUNG: gesperrtes Zeitfenster {w} für {args.ollama_url}.")
+    jpeg = page_to_jpeg(src, pno)
+    print(f"Seite {args.page} rasterisiert ({len(jpeg)//1024} KB), "
+          f"Engine: {args.ocr} …")
+    t0 = time.time()
+    text, used = ocr_jpeg(jpeg, args.lang, args.ocr, ocr)
+    print(f"--- OCR-Ergebnis ({time.time()-t0:.1f}s, engine={used}) ---")
+    print(text[:2000] if text else "(kein Text erkannt)")
+    return 0
+
+
+def cmd_md2pdf(args):
+    md = Path(args.input).expanduser().resolve()
+    if not md.is_file():
+        raise project.CleanError(f"Markdown nicht gefunden: {md}")
+    if args.images:
+        img_dir = Path(args.images).expanduser().resolve()
+        if not img_dir.is_dir():
+            raise project.CleanError(f"Bilder-Ordner nicht gefunden: {img_dir}")
+        from tuxbook_lib.images import rebase_image_paths
+        md = rebase_image_paths(md, img_dir)
+    out = Path(args.out).expanduser() if args.out \
+        else md.with_name(md.stem + "_neu.pdf")
+    md_to_pdf(md, out, title=args.title)
+    print(f"PDF neu gesetzt: {out}  ({out.stat().st_size / 1024:.0f} KB)")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="tuxbook", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version=f"tuxbook {__version__}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="PDF übersetzen + neu setzen")
+    p_run.add_argument("input", help="Eingabe-PDF")
+    p_run.add_argument("--from", dest="src_lang", default="auto",
+                       help="Quellsprache ('auto' = erkennen)")
+    p_run.add_argument("--to", dest="tgt_lang", default="de",
+                       help="Zielsprache (Standard: de)")
+    p_run.add_argument("--mode", default="page", choices=["page", "flow"],
+                       help="page = 1:1 pro Seite; flow = neu gesetzt "
+                            "(Standard: page)")
+    p_run.add_argument("--pages", default=None, help="z.B. '1-50,60,71-80'")
+    p_run.add_argument("--job", default=None, help="Jobname (Resume-Schlüssel)")
+    p_run.add_argument("--glossary", default=None,
+                       help="Glossar-Datei 'Begriff = Übersetzung' pro Zeile")
+    p_run.add_argument("--engine", default="bahnhof",
+                       choices=["bahnhof", "ollama"],
+                       help="Übersetzungs-Engine: bahnhof (Standard) oder "
+                            "ollama = Mini-Modell auf dem Ollama-Endpunkt")
+    p_run.add_argument("--translate-model", default=None,
+                       help="Modellname für --engine ollama (z.B. "
+                            "'zongwei/gemma3-translator:1b')")
+    p_run.add_argument("--title", default=None,
+                       help="Titel für Titelseite (nur flow)")
+    p_run.add_argument("--cover-image", default=None,
+                       help="Pfad zu Cover-Bild für Titelseite "
+                            "(PNG/JPEG, nur flow)")
+    p_run.add_argument("--cover-subtitle", default=None,
+                       help="Untertitel unter dem Cover-Bild "
+                            "(nur bei --cover-image)")
+    p_run.add_argument("--page-break", action="store_true",
+                       help="(flow) Seitenumbruch nach jeder Quellseite")
+    p_run.add_argument("--workers", type=int, default=3,
+                       help="parallele Seiten-Worker für Übersetzung (Standard: 3)")
+    p_run.add_argument("--text-source", default="auto",
+                       choices=["auto", "embedded", "ocr"],
+                       help="Textquelle: auto = eingebetteter Text, OCR nur "
+                            "als Fallback (Standard); embedded = nie OCR; "
+                            "ocr = eingebetteten Text ignorieren und jede "
+                            "Seite rendern + OCR")
+    p_run.add_argument("--sleep", type=float, default=0.0,
+                       help="Pause nach jeder Seite (Sekunden)")
+    p_run.add_argument("--no-ocr", action="store_true",
+                       help="OCR deaktivieren (Alias für --ocr off)")
+    p_run.add_argument("--ocr", default="tesseract",
+                       choices=["tesseract", "auto", "ollama", "off"],
+                       help="OCR-Engine (Standard: tesseract; 'auto' erlaubt "
+                            "Ollama-Vision als Fallback, 'ollama' erzwingt sie)")
+    p_run.add_argument("--retranslate", action="store_true",
+                       help="Cache ignorieren, alles neu übersetzen")
+    p_run.add_argument("--no-term-lock", action="store_true",
+                       help="Terminologie-Lock (konsistente Begriffe) "
+                            "deaktivieren")
+    p_run.add_argument("--render-only", action="store_true",
+                       help="nichts übersetzen, nur Ziel-PDF aus Cache bauen")
+    p_run.add_argument("--no-render", action="store_true",
+                       help="nur übersetzen, Rendering später ausführen")
+    _add_common(p_run)
+    p_run.set_defaults(func=cmd_run)
+
+    p_st = sub.add_parser("status", help="Jobstatus anzeigen")
+    p_st.add_argument("--job", required=True)
+    p_st.set_defaults(func=cmd_status)
+
+    p_mt = sub.add_parser("make-test-pdf",
+                          help="kleines englisches Test-PDF erzeugen")
+    p_mt.add_argument("--out", default="test_book_en.pdf")
+    p_mt.set_defaults(func=cmd_make_test)
+
+    p_ocr = sub.add_parser("ocr-test", help="OCR einer Seite testen")
+    p_ocr.add_argument("input")
+    p_ocr.add_argument("--page", type=int, default=1)
+    p_ocr.add_argument("--lang", default="en", help="Sprache der Seite")
+    p_ocr.add_argument("--ocr", default="tesseract",
+                       choices=["tesseract", "auto", "ollama"])
+    _add_common(p_ocr)
+    p_ocr.set_defaults(func=cmd_ocr_test)
+
+    p_m2p = sub.add_parser("md2pdf",
+                           help="Markdown (tuxbook-Export) als Buch-PDF neu setzen")
+    p_m2p.add_argument("input", help="Markdown-Datei (z.B. out/job_page.md)")
+    p_m2p.add_argument("--out", default=None,
+                       help="Ausgabe-PDF (Standard: <md-Stem>_neu.pdf)")
+    p_m2p.add_argument("--title", default=None,
+                       help="Titel für das Titelblatt (Standard: H1 im MD)")
+    p_m2p.add_argument("--images", default=None,
+                       help="Bilder-Ordner, falls MD/Bilder verschoben wurden "
+                            "(Standard: relativ zum MD)")
+    p_m2p.set_defaults(func=cmd_md2pdf)
+
+    args = ap.parse_args(argv)
+    try:
+        return args.func(args)
+    except project.CleanError as e:
+        print(f"FEHLER: {e}", file=sys.stderr)
+        return 2
+    except LLMError as e:
+        print(f"LLM-FEHLER: {e}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

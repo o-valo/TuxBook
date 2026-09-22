@@ -1,0 +1,16 @@
+# TuxBook — Konfiguration (Beispiel)
+# Kopieren nach tuxbook.conf und eigene Endpunkte eintragen.
+# Alternativ funktionieren auch Umgebungsvariablen:
+#   TUXBOOK_BAHNHOF_URL, TUXBOOK_BAHNHOF_MODEL, TUXBOOK_OLLAMA_URL,
+#   TUXBOOK_OLLAMA_MODEL, TUXBOOK_OLLAMA_URL_ALT
+
+# OpenAI-kompatible Chat-API für die Übersetzung
+BAHNHOF_URL = http://localhost:8000/v1
+BAHNHOF_MODEL = llm-bahnhof
+
+# Ollama-Endpunkt für Vision-OCR (Fallback) und optionale Mini-Übersetzer
+OLLAMA_URL = http://localhost:11434
+OLLAMA_MODEL = gemma4:12b
+
+# Optionaler zweiter Ollama-Endpunkt (leer lassen, wenn nicht vorhanden)
+OLLAMA_URL_ALT =

@@ -1,0 +1,6 @@
+pymupdf>=1.24
+reportlab>=4.0
+pillow>=10.0
+requests>=2.31
+# OCR (Standard-Engine, rein lokal):
+pytesseract>=0.3.10
