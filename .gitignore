@@ -1,0 +1,21 @@
+# Persönliche Infrastruktur & Daten
+tuxbook.conf
+no-go.md
+*.zip
+*.pdf
+
+# Laufzeitdaten
+jobs/
+out/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Erzeugte Titel-/Cover-Bilder (Ergebnis von Testläufen, kein Quellcode)
+cover_*.png
+title_page.png
+
+# Editor/OS
+.DS_Store
+*.swp
