@@ -1,0 +1,7 @@
+"""TuxBook — Bibliothekspaket (Extraktion, Übersetzung, Rendering).
+
+Copyright (C) 2026 Olav Surawski (https://github.com/o-valo)
+SPDX-License-Identifier: AGPL-3.0-or-later
+"""
+
+__version__ = "0.7.0"
