@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="tuxbook.jpg" width="100%"
+       alt="A detailed conceptual illustration of an automated book publishing workflow inside a server room. On the left, a luminous, holographic human figure sits at a desk, actively interacting with a complex network interface labeled "ALPHA TRANSLATOR". Next to them, a large computer screen displays the translated text "THE LEGACY OF LEARNING". An industrial printing machine, labeled "OMEGA PRINTERS INC.", is at the center, connected to a conveyor belt. A completed book travels along this belt, and on the right, a robotic arm with multiple joints, labeled 'BETA EDITOR', inspects an open copy. Another screen near the editor shows the text "DAS NEUE WISSEN". Server racks line the entire background. ">
+</p>
+
 # TuxBook (tuxbook)
 
 [![CI](https://github.com/o-valo/TuxBook/actions/workflows/ci.yml/badge.svg)](https://github.com/o-valo/TuxBook/actions/workflows/ci.yml)
